@@ -2,65 +2,61 @@
 
 import os
 import fnmatch
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 import paramiko
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
 console = Console()
 
+# 병렬 전송 worker 수 (SSH 연결 수와 동일)
+MAX_WORKERS = 8
+
 
 def should_ignore(path: str, patterns: list[str]) -> bool:
-    """
-    Check if a path matches any ignore pattern.
-
-    Handles:
-      - exact name match:   "venv"   matches  "venv"  or  "a/venv/b"
-      - trailing slash:     "data/"  matches  "data"  dir and its contents
-      - glob patterns:      "*.pyc"  matches  "foo.pyc"
-      - path patterns:      "a/b"    matches  "a/b/c.py"
-    """
-    # Normalize: strip leading ./ and trailing slashes from the input path
+    """Check if a path matches any ignore pattern."""
     path = path.lstrip("./").rstrip("/")
     path_obj = Path(path)
-    name = path_obj.name          # last component
-    parts = path_obj.parts        # all components
+    name = path_obj.name
+    parts = path_obj.parts
 
     for raw_pattern in patterns:
-        # Normalize pattern too: strip trailing slash (treat "data/" same as "data")
         pattern = raw_pattern.rstrip("/")
         if not pattern:
             continue
-
-        # 1. Match against the bare filename
         if fnmatch.fnmatch(name, pattern):
             return True
-
-        # 2. Match against the full relative path
         if fnmatch.fnmatch(path, pattern):
             return True
-
-        # 3. Match any path component  →  catches "data" inside "a/data/b/file.csv"
         for part in parts:
             if fnmatch.fnmatch(part, pattern):
                 return True
-
     return False
 
 
 def get_all_files(local_root: Path, ignore_patterns: list[str]) -> list[Path]:
-    """Recursively get all files not matching ignore patterns."""
+    """
+    Recursively collect files, pruning ignored dirs early so
+    os.walk never descends into them.
+    """
     files = []
     for root, dirs, filenames in os.walk(local_root):
-        # rel_root relative to local_root, normalized (no leading ./)
         rel_root = os.path.relpath(root, local_root)
         if rel_root == ".":
             rel_root = ""
 
-        # Prune ignored dirs in-place so os.walk doesn't descend into them
+        # ── Prune dirs in-place ──────────────────────────────────────────────
+        # This is the key: ignored directories are removed from `dirs` so
+        # os.walk never descends into them at all.
         dirs[:] = [
             d for d in dirs
-            if not should_ignore(os.path.join(rel_root, d) if rel_root else d, ignore_patterns)
+            if not should_ignore(
+                os.path.join(rel_root, d) if rel_root else d,
+                ignore_patterns,
+            )
         ]
 
         for fname in filenames:
@@ -112,6 +108,39 @@ def ensure_remote_dir(sftp: paramiko.SFTPClient, remote_path: str):
             sftp.mkdir(current)
 
 
+def _make_remote_dirs(server_config: dict, remote_dirs: set[str]):
+    """Pre-create all needed remote directories via a single SSH connection."""
+    client = connect_ssh(server_config)
+    sftp = client.open_sftp()
+    for d in sorted(remote_dirs):  # sorted = parents before children
+        try:
+            sftp.stat(d)
+        except FileNotFoundError:
+            try:
+                sftp.mkdir(d)
+            except Exception:
+                pass  # parent may not exist yet; ensure_remote_dir handles it
+    sftp.close()
+    client.close()
+
+
+def _upload_worker(
+    args: tuple,
+) -> tuple[str, Optional[Exception]]:
+    """Upload a single file. Returns (rel_path_str, error_or_None)."""
+    local_file, remote_file, remote_dir, server_config = args
+    try:
+        client = connect_ssh(server_config)
+        sftp = client.open_sftp()
+        ensure_remote_dir(sftp, remote_dir)
+        sftp.put(str(local_file), remote_file)
+        sftp.close()
+        client.close()
+        return (str(local_file), None)
+    except Exception as e:
+        return (str(local_file), e)
+
+
 def sync_files(
     local_root: Path,
     remote_root: str,
@@ -121,7 +150,7 @@ def sync_files(
     verbose: bool = True,
 ) -> tuple[int, int]:
     """
-    Sync files from local to remote.
+    Sync files from local to remote using a parallel connection pool.
 
     Args:
         changed_files: If provided, only sync these specific files.
@@ -130,50 +159,63 @@ def sync_files(
     Returns:
         (synced_count, error_count)
     """
+    # ── 1. Collect files to sync ─────────────────────────────────────────────
+    if changed_files is not None:
+        files_to_sync = [
+            f for f in changed_files
+            if not should_ignore(str(f), ignore_patterns)
+        ]
+    else:
+        if verbose:
+            console.print("[dim]Scanning local files...[/dim]", end="\r")
+        files_to_sync = get_all_files(local_root, ignore_patterns)
+
+    if not files_to_sync:
+        if verbose:
+            console.print("[dim]No files to sync.[/dim]")
+        return 0, 0
+
+    if verbose:
+        console.print(f"[dim]Found {len(files_to_sync)} files to sync.[/dim]")
+
+    # ── 2. Build upload task list ─────────────────────────────────────────────
+    tasks = []
+    for rel_path in files_to_sync:
+        local_file = local_root / rel_path
+        remote_file = os.path.join(remote_root, str(rel_path))
+        remote_dir = os.path.dirname(remote_file)
+        tasks.append((local_file, remote_file, remote_dir, server_config))
+
+    # ── 3. Parallel upload ────────────────────────────────────────────────────
     synced = 0
     errors = 0
+    workers = min(MAX_WORKERS, len(tasks))
 
-    try:
-        client = connect_ssh(server_config)
-        sftp = client.open_sftp()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task("Syncing...", total=len(tasks))
 
-        if changed_files is not None:
-            files_to_sync = [
-                f for f in changed_files
-                if not should_ignore(str(f), ignore_patterns)
-            ]
-        else:
-            files_to_sync = get_all_files(local_root, ignore_patterns)
-
-        if not files_to_sync:
-            if verbose:
-                console.print("[dim]No files to sync.[/dim]")
-            sftp.close()
-            client.close()
-            return 0, 0
-
-        for rel_path in files_to_sync:
-            local_file = local_root / rel_path
-            remote_file = os.path.join(remote_root, str(rel_path))
-            remote_dir = os.path.dirname(remote_file)
-
-            try:
-                if remote_dir:
-                    ensure_remote_dir(sftp, remote_dir)
-                sftp.put(str(local_file), remote_file)
-                synced += 1
-                if verbose:
-                    console.print(f"  [green]✓[/green] {rel_path}")
-            except Exception as e:
-                errors += 1
-                console.print(f"  [red]✗[/red] {rel_path}: {e}")
-
-        sftp.close()
-        client.close()
-
-    except Exception as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        errors += 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_upload_worker, t): t for t in tasks}
+            for future in as_completed(futures):
+                local_file, remote_file, remote_dir, _ = futures[future]
+                rel = os.path.relpath(str(local_file), str(local_root))
+                local_path_str, err = future.result()
+                if err is None:
+                    synced += 1
+                    if verbose:
+                        console.print(f"  [green]✓[/green] {rel}")
+                else:
+                    errors += 1
+                    console.print(f"  [red]✗[/red] {rel}: {err}")
+                progress.advance(task_id)
 
     return synced, errors
 
