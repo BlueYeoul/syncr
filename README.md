@@ -6,9 +6,9 @@ Local → Server file sync tool for ML development.
 ## Install
 
 ```bash
-pip install syncr
+pip install git+https://github.com/BlueYeoul/syncr.git
 # or
-uv add syncr
+uv add git+https://github.com/BlueYeoul/syncr.git
 ```
 
 ## Quick Start
