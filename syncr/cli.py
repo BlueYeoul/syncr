@@ -17,6 +17,7 @@ from .config import (
     get_server_config, list_servers, save_server, delete_server,
     get_local_config, save_local_config,
     get_ignore_patterns, init_ignore_file,
+    parse_ssh_config, is_direct_address,
     LOCAL_CONFIG_FILE,
 )
 from .sync import sync_files, test_connection
@@ -43,29 +44,70 @@ def server():
 @server.command("add")
 @click.argument("profile")
 def server_add(profile: str):
-    """Add a new server profile."""
+    """Add a new server profile.
+
+    PROFILE can be:
+      - an SSH config alias  (e.g. myserver → reads ~/.ssh/config)
+      - an IP / hostname     (e.g. 192.168.1.100 or gpu.mylab.com)
+    """
     console.print(f"\n[bold cyan]Adding server profile:[/bold cyan] {profile}\n")
 
-    host = Prompt.ask("Host (IP or hostname)")
-    port = Prompt.ask("Port", default="22")
-    user = Prompt.ask("Username")
-    auth = Prompt.ask("Auth method", choices=["password", "key"], default="key")
+    config = {}
 
-    config = {
-        "host": host,
-        "port": int(port),
-        "user": user,
-        "auth": auth,
-    }
+    # ── Case 1: looks like a direct address (IP / FQDN) ──────────────────────
+    if is_direct_address(profile):
+        console.print(f"[dim]Detected direct address: {profile}[/dim]")
+        config["host"] = profile
+        config["port"] = int(Prompt.ask("Port", default="22"))
+        config["user"] = Prompt.ask("Username")
+        config["auth"] = Prompt.ask("Auth method", choices=["password", "key"], default="key")
+        if config["auth"] == "key":
+            config["key_path"] = Prompt.ask("SSH key path", default="~/.ssh/id_rsa")
+        else:
+            if Confirm.ask("Save password? (not recommended)", default=False):
+                config["password"] = getpass.getpass("Password: ")
 
-    if auth == "key":
-        key_path = Prompt.ask("SSH key path", default="~/.ssh/id_rsa")
-        config["key_path"] = key_path
+    # ── Case 2: try SSH config alias first ───────────────────────────────────
     else:
-        save_pw = Confirm.ask("Save password? (not recommended)", default=False)
-        if save_pw:
-            pw = getpass.getpass("Password: ")
-            config["password"] = pw
+        ssh_cfg = parse_ssh_config(profile)
+        if ssh_cfg:
+            console.print(f"[green]✓[/green] Found [bold]{profile}[/bold] in ~/.ssh/config\n")
+            console.print(f"  Host: [cyan]{ssh_cfg.get('host', profile)}[/cyan]")
+            console.print(f"  User: [cyan]{ssh_cfg.get('user', '?')}[/cyan]")
+            console.print(f"  Port: [cyan]{ssh_cfg.get('port', 22)}[/cyan]")
+            console.print(f"  Key:  [cyan]{ssh_cfg.get('key_path', '~/.ssh/id_rsa')}[/cyan]\n")
+
+            if Confirm.ask("Use these settings?", default=True):
+                config = ssh_cfg
+                # Allow password auth override if needed
+                if Confirm.ask("Use password instead of key?", default=False):
+                    config["auth"] = "password"
+                    config.pop("key_path", None)
+                    if Confirm.ask("Save password? (not recommended)", default=False):
+                        config["password"] = getpass.getpass("Password: ")
+            else:
+                # Manual override
+                config["host"] = Prompt.ask("Host", default=ssh_cfg.get("host", profile))
+                config["port"] = int(Prompt.ask("Port", default=str(ssh_cfg.get("port", 22))))
+                config["user"] = Prompt.ask("Username", default=ssh_cfg.get("user", ""))
+                config["auth"] = Prompt.ask("Auth method", choices=["password", "key"], default="key")
+                if config["auth"] == "key":
+                    config["key_path"] = Prompt.ask("SSH key path", default=ssh_cfg.get("key_path", "~/.ssh/id_rsa"))
+                else:
+                    if Confirm.ask("Save password? (not recommended)", default=False):
+                        config["password"] = getpass.getpass("Password: ")
+        else:
+            # Not found in SSH config → treat as plain hostname
+            console.print(f"[dim]'{profile}' not found in ~/.ssh/config — entering manually.[/dim]\n")
+            config["host"] = profile
+            config["port"] = int(Prompt.ask("Port", default="22"))
+            config["user"] = Prompt.ask("Username")
+            config["auth"] = Prompt.ask("Auth method", choices=["password", "key"], default="key")
+            if config["auth"] == "key":
+                config["key_path"] = Prompt.ask("SSH key path", default="~/.ssh/id_rsa")
+            else:
+                if Confirm.ask("Save password? (not recommended)", default=False):
+                    config["password"] = getpass.getpass("Password: ")
 
     save_server(profile, config)
     console.print(f"\n[green]✓[/green] Server profile [bold]{profile}[/bold] saved.")
@@ -140,7 +182,6 @@ def init(profile: Optional[str], remote: Optional[str]):
 
     local_path = str(Path.cwd())
 
-    # Choose server profile
     servers = list_servers()
     if not servers:
         console.print("[yellow]No server profiles found. Add one first:[/yellow]")
@@ -158,8 +199,12 @@ def init(profile: Optional[str], remote: Optional[str]):
                 default=list(servers.keys())[0],
             )
 
+    server_cfg = get_server_config(profile)
     if not remote:
-        remote = Prompt.ask("Remote project path (absolute)", default=f"/home/{servers[profile]['user']}/projects/{Path.cwd().name}")
+        remote = Prompt.ask(
+            "Remote project path (absolute)",
+            default=f"/home/{server_cfg['user']}/projects/{Path.cwd().name}",
+        )
 
     config = {
         "server": profile,
@@ -168,14 +213,13 @@ def init(profile: Optional[str], remote: Optional[str]):
     }
     save_local_config(config)
 
-    # Create .syncrignore
     created = init_ignore_file()
     if created:
         console.print(f"[green]✓[/green] Created [bold].syncrignore[/bold]")
 
     console.print(f"[green]✓[/green] Created [bold]{LOCAL_CONFIG_FILE}[/bold]")
     console.print(f"\n  Local:  [dim]{local_path}[/dim]")
-    console.print(f"  Remote: [dim]{servers[profile]['host']}:{remote}[/dim]")
+    console.print(f"  Remote: [dim]{server_cfg['host']}:{remote}[/dim]")
     console.print(f"\nRun [bold cyan]syncr push[/bold cyan] for initial sync, or [bold cyan]syncr watch[/bold cyan] to auto-sync.")
 
 

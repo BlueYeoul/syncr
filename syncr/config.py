@@ -1,6 +1,7 @@
 """Configuration management for syncr."""
 
 import os
+import re
 import toml
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,62 @@ DEFAULT_IGNORE_PATTERNS = [
     "*.log",
 ]
 
+
+# ─── SSH config parser ────────────────────────────────────────────────────────
+
+def parse_ssh_config(host_alias: str) -> Optional[dict]:
+    """
+    Read ~/.ssh/config and return connection info for a given Host alias.
+    Returns None if alias not found.
+    """
+    ssh_config_path = Path.home() / ".ssh" / "config"
+    if not ssh_config_path.exists():
+        return None
+
+    result = {}
+    in_block = False
+
+    with open(ssh_config_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.lower().startswith("host "):
+                current_hosts = line.split(None, 1)[1].split()
+                in_block = host_alias in current_hosts
+                continue
+
+            if in_block:
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    key, value = parts[0].lower(), parts[1].strip()
+                    if key == "hostname":
+                        result["host"] = value
+                    elif key == "user":
+                        result["user"] = value
+                    elif key == "port":
+                        result["port"] = int(value)
+                    elif key == "identityfile":
+                        result["key_path"] = os.path.expanduser(value)
+
+    if not result:
+        return None
+
+    # If no HostName directive, the alias itself is the host
+    result.setdefault("host", host_alias)
+    result.setdefault("port", 22)
+    result.setdefault("auth", "key")
+    result.setdefault("key_path", "~/.ssh/id_rsa")
+    return result
+
+
+def is_direct_address(s: str) -> bool:
+    """True if the string looks like an IP or FQDN (contains . or :) rather than an SSH alias."""
+    return bool(re.search(r'[.:]', s))
+
+
+# ─── global / local config ────────────────────────────────────────────────────
 
 def get_global_config() -> dict:
     """Load global config (~/.syncr/config.toml)."""
