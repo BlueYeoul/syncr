@@ -1,7 +1,6 @@
 """SSH-based file sync engine."""
 
 import os
-import stat
 import fnmatch
 from pathlib import Path
 from typing import Optional
@@ -12,18 +11,40 @@ console = Console()
 
 
 def should_ignore(path: str, patterns: list[str]) -> bool:
-    """Check if a path matches any ignore pattern."""
-    name = os.path.basename(path)
-    for pattern in patterns:
+    """
+    Check if a path matches any ignore pattern.
+
+    Handles:
+      - exact name match:   "venv"   matches  "venv"  or  "a/venv/b"
+      - trailing slash:     "data/"  matches  "data"  dir and its contents
+      - glob patterns:      "*.pyc"  matches  "foo.pyc"
+      - path patterns:      "a/b"    matches  "a/b/c.py"
+    """
+    # Normalize: strip leading ./ and trailing slashes from the input path
+    path = path.lstrip("./").rstrip("/")
+    path_obj = Path(path)
+    name = path_obj.name          # last component
+    parts = path_obj.parts        # all components
+
+    for raw_pattern in patterns:
+        # Normalize pattern too: strip trailing slash (treat "data/" same as "data")
+        pattern = raw_pattern.rstrip("/")
+        if not pattern:
+            continue
+
+        # 1. Match against the bare filename
         if fnmatch.fnmatch(name, pattern):
             return True
+
+        # 2. Match against the full relative path
         if fnmatch.fnmatch(path, pattern):
             return True
-        # Directory match (e.g. "venv" matches "venv/anything")
-        parts = Path(path).parts
+
+        # 3. Match any path component  →  catches "data" inside "a/data/b/file.csv"
         for part in parts:
             if fnmatch.fnmatch(part, pattern):
                 return True
+
     return False
 
 
@@ -31,16 +52,22 @@ def get_all_files(local_root: Path, ignore_patterns: list[str]) -> list[Path]:
     """Recursively get all files not matching ignore patterns."""
     files = []
     for root, dirs, filenames in os.walk(local_root):
+        # rel_root relative to local_root, normalized (no leading ./)
         rel_root = os.path.relpath(root, local_root)
-        # Filter ignored dirs in-place (prevents os.walk from descending)
+        if rel_root == ".":
+            rel_root = ""
+
+        # Prune ignored dirs in-place so os.walk doesn't descend into them
         dirs[:] = [
             d for d in dirs
-            if not should_ignore(os.path.join(rel_root, d) if rel_root != "." else d, ignore_patterns)
+            if not should_ignore(os.path.join(rel_root, d) if rel_root else d, ignore_patterns)
         ]
+
         for fname in filenames:
-            rel_path = os.path.join(rel_root, fname) if rel_root != "." else fname
+            rel_path = os.path.join(rel_root, fname) if rel_root else fname
             if not should_ignore(rel_path, ignore_patterns):
                 files.append(Path(rel_path))
+
     return files
 
 
@@ -65,7 +92,9 @@ def connect_ssh(server_config: dict) -> paramiko.SSHClient:
             kwargs["password"] = password
         else:
             import getpass
-            kwargs["password"] = getpass.getpass(f"Password for {server_config['user']}@{server_config['host']}: ")
+            kwargs["password"] = getpass.getpass(
+                f"Password for {server_config['user']}@{server_config['host']}: "
+            )
 
     client.connect(**kwargs)
     return client
@@ -93,11 +122,11 @@ def sync_files(
 ) -> tuple[int, int]:
     """
     Sync files from local to remote.
-    
+
     Args:
         changed_files: If provided, only sync these specific files.
                        If None, sync all files (full sync).
-    
+
     Returns:
         (synced_count, error_count)
     """
