@@ -18,7 +18,10 @@ MAX_WORKERS = 8
 
 def should_ignore(path: str, patterns: list[str]) -> bool:
     """Check if a path matches any ignore pattern."""
-    path = path.lstrip("./").rstrip("/")
+    # Strip only leading "./" prefix — do NOT use lstrip which eats dots from .git, .DS_Store
+    while path.startswith("./"):
+        path = path[2:]
+    path = path.rstrip("/")
     path_obj = Path(path)
     name = path_obj.name
     parts = path_obj.parts
