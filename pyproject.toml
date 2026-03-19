@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "syncr"
@@ -19,5 +19,6 @@ dependencies = [
 [project.scripts]
 syncr = "syncr.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["syncr"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["syncr*"]
