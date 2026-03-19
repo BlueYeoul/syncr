@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-syncr = "syncr.cli:main"
+syncr = "syncr:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
